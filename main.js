@@ -2,9 +2,11 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
+import superagent from 'superagent';
 
-// Параметри командного рядка 
+// ---------- Параметри командного рядка ----------
 
 const program = new Command();
 
@@ -29,9 +31,11 @@ function parsePort(value) {
 }
 
 const CACHE_DIR = path.resolve(options.cache);
+const UPSTREAM = 'https://http.cat';
+const UPSTREAM_TIMEOUT_MS = 10_000;
 const ALLOWED_METHODS = 'GET, PUT, DELETE';
 
-// Допоміжні функції
+// ---------- Допоміжні функції ----------
 
 // Шлях має бути рівно "/<три цифри>". Регулярний вираз не пропускає
 // "..", "/" та інші символи, тож вийти за межі теки кешу неможливо.
@@ -42,6 +46,10 @@ function parseCode(url) {
   return match ? match[1] : null;
 }
 
+function cacheFile(code) {
+  return path.join(CACHE_DIR, `${code}.jpg`);
+}
+
 function sendText(res, status, message, extraHeaders = {}) {
   res.writeHead(status, {
     'Content-Type': 'text/plain; charset=utf-8',
@@ -50,7 +58,81 @@ function sendText(res, status, message, extraHeaders = {}) {
   res.end(message + '\n');
 }
 
-//  Сервер 
+function sendImage(res, data, source) {
+  res.writeHead(200, {
+    'Content-Type': 'image/jpeg',
+    'Content-Length': data.length,
+    'X-Cache': source, // HIT — з кешу, MISS — щойно отримано з http.cat
+  });
+  res.end(data);
+}
+
+// Атомарний запис: спочатку тимчасовий файл, потім rename.
+// Читач ніколи не побачить наполовину записану картинку.
+async function writeCacheFile(code, data) {
+  const target = cacheFile(code);
+  const tmp = `${target}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, data);
+    await fs.rename(tmp, target);
+  } catch (err) {
+    await fs.rm(tmp, { force: true });
+    throw err;
+  }
+}
+
+async function readCacheFile(code) {
+  try {
+    return await fs.readFile(cacheFile(code));
+  } catch (err) {
+    if (err.code === 'ENOENT') return null; // промах кешу
+    throw err; // інші помилки (немає прав тощо) — це 500
+  }
+}
+
+// Запит до http.cat. Повертає Buffer із картинкою або null,
+// якщо картинку отримати не вдалося (404, мережа, тайм-аут).
+async function fetchFromUpstream(code) {
+  try {
+    const res = await superagent
+      .get(`${UPSTREAM}/${code}`)
+      .timeout(UPSTREAM_TIMEOUT_MS);
+
+    if (!res.type.startsWith('image/') || !Buffer.isBuffer(res.body)) {
+      console.error(`http.cat повернув не картинку для ${code}: ${res.type}`);
+      return null;
+    }
+    return res.body;
+  } catch (err) {
+    if (err.response) {
+      console.error(`http.cat відповів ${err.status} для коду ${code}`);
+    } else {
+      console.error(`Помилка запиту до http.cat (${code}): ${err.code ?? err.message}`);
+    }
+    return null;
+  }
+}
+
+// ---------- Обробники методів ----------
+
+async function handleGet(res, code) {
+  const cached = await readCacheFile(code);
+  if (cached) {
+    sendImage(res, cached, 'HIT');
+    return;
+  }
+
+  const image = await fetchFromUpstream(code);
+  if (!image) {
+    sendText(res, 404, `Картинку для коду ${code} не знайдено ні в кеші, ні на http.cat`);
+    return;
+  }
+
+  await writeCacheFile(code, image); // спочатку в кеш,
+  sendImage(res, image, 'MISS');     // потім клієнтові
+}
+
+// ---------- Сервер ----------
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -65,7 +147,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    sendText(res, 501, `Метод ${req.method} ще не реалізовано`);
+    if (req.method === 'GET') await handleGet(res, code);
+    else sendText(res, 501, `Метод ${req.method} ще не реалізовано`);
   } catch (err) {
     console.error(`${req.method} ${req.url}:`, err);
     if (!res.headersSent) {
