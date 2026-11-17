@@ -29,8 +29,18 @@ function parsePort(value) {
 }
 
 const CACHE_DIR = path.resolve(options.cache);
+const ALLOWED_METHODS = 'GET, PUT, DELETE';
 
-// Допоміжні функції 
+// Допоміжні функції
+
+// Шлях має бути рівно "/<три цифри>". Регулярний вираз не пропускає
+// "..", "/" та інші символи, тож вийти за межі теки кешу неможливо.
+// Чи існує такий код насправді, вирішує http.cat (інакше — 404).
+function parseCode(url) {
+  const { pathname } = new URL(url, 'http://localhost');
+  const match = /^\/(\d{3})$/.exec(pathname);
+  return match ? match[1] : null;
+}
 
 function sendText(res, status, message, extraHeaders = {}) {
   res.writeHead(status, {
@@ -40,11 +50,22 @@ function sendText(res, status, message, extraHeaders = {}) {
   res.end(message + '\n');
 }
 
-// Сервер 
+//  Сервер 
 
 const server = http.createServer(async (req, res) => {
   try {
-    sendText(res, 501, 'Ще не реалізовано');
+    if (!['GET', 'PUT', 'DELETE'].includes(req.method)) {
+      sendText(res, 405, `Метод ${req.method} не підтримується`, { Allow: ALLOWED_METHODS });
+      return;
+    }
+
+    const code = parseCode(req.url);
+    if (!code) {
+      sendText(res, 400, 'Некоректний шлях: очікується /<код стану HTTP>, наприклад /404');
+      return;
+    }
+
+    sendText(res, 501, `Метод ${req.method} ще не реалізовано`);
   } catch (err) {
     console.error(`${req.method} ${req.url}:`, err);
     if (!res.headersSent) {
