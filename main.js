@@ -33,6 +33,7 @@ function parsePort(value) {
 const CACHE_DIR = path.resolve(options.cache);
 const UPSTREAM = 'https://http.cat';
 const UPSTREAM_TIMEOUT_MS = 10_000;
+const MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 МБ
 const ALLOWED_METHODS = 'GET, PUT, DELETE';
 
 // ---------- Допоміжні функції ----------
@@ -65,6 +66,23 @@ function sendImage(res, data, source) {
     'X-Cache': source, // HIT — з кешу, MISS — щойно отримано з http.cat
   });
   res.end(data);
+}
+
+// Читання тіла запиту цілком: потік req ітерується через for await,
+// жодних колбеків. Розмір обмежено, щоб не переповнити пам'ять.
+async function readBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      const err = new Error('Тіло запиту завелике');
+      err.status = 413;
+      throw err;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 // Атомарний запис: спочатку тимчасовий файл, потім rename.
@@ -132,6 +150,18 @@ async function handleGet(res, code) {
   sendImage(res, image, 'MISS');     // потім клієнтові
 }
 
+
+async function handlePut(req, res, code) {
+  const body = await readBody(req);
+  if (body.length === 0) {
+    sendText(res, 400, 'Тіло запиту порожнє: передайте картинку');
+    return;
+  }
+  await writeCacheFile(code, body);
+  sendText(res, 201, `Картинку для коду ${code} збережено в кеш`);
+}
+
+
 // ---------- Сервер ----------
 
 const server = http.createServer(async (req, res) => {
@@ -147,7 +177,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'GET') await handleGet(res, code);
+     if (req.method === 'GET') await handleGet(res, code);
+    else if (req.method === 'PUT') await handlePut(req, res, code);
     else sendText(res, 501, `Метод ${req.method} ще не реалізовано`);
   } catch (err) {
     console.error(`${req.method} ${req.url}:`, err);
